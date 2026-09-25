@@ -48,6 +48,6 @@ npm run eval:live   # 联网调用 DeepSeek (需要配置 API Key) / Live DeepSe
 ```
 评测报告将自动输出至 / Evaluation reports are exported directly to: `eval report/`
 
-### 3. 前端应用 / Frontend
+### 3. 前端 / Frontend
 前端客户端目前正在积极开发中，测试界面即将推出。  
 *Frontend application is under active development and will be available for testing soon.*
