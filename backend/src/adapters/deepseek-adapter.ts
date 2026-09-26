@@ -1,3 +1,6 @@
+import https from "node:https";
+import http from "node:http";
+import { URL } from "node:url";
 import { ModelAdapter, ModelAdapterOptions } from "./model-adapter.js";
 import {
   EnterpriseTaskContext,
@@ -20,7 +23,7 @@ export class DeepSeekAdapter implements ModelAdapter {
 
   constructor(options: ModelAdapterOptions = {}) {
     this.apiKey = options.apiKey || process.env.DEEPSEEK_API_KEY || "";
-    this.baseUrl = (options.baseUrl || process.env.DEEPSEEK_BASE_URL || "https://api.deepseek.com/v1").replace(/\/$/, "");
+    this.baseUrl = (options.baseUrl || process.env.DEEPSEEK_BASE_URL || "https://api.deepseek.com").replace(/\/$/, "");
     this.chatModel = options.chatModel || process.env.DEEPSEEK_CHAT_MODEL || "deepseek-chat";
     this.reasonerModel = options.reasonerModel || process.env.DEEPSEEK_REASONER_MODEL || "deepseek-reasoner";
     this.timeoutMs = options.timeoutMs || 60000;
@@ -31,50 +34,74 @@ export class DeepSeekAdapter implements ModelAdapter {
       throw new Error("DEEPSEEK_API_KEY is not configured. Set MODEL_PROVIDER=mock or provide API key in .env.");
     }
 
-    const controller = new AbortController();
-    const timeout = setTimeout(() => controller.abort(), this.timeoutMs);
+    const body: Record<string, any> = {
+      model,
+      messages: [
+        { role: "system", content: systemPrompt },
+        { role: "user", content: userPrompt }
+      ],
+      temperature: model === this.reasonerModel ? 0.3 : 0.1
+    };
 
-    try {
-      const body: Record<string, any> = {
-        model,
-        messages: [
-          { role: "system", content: systemPrompt },
-          { role: "user", content: userPrompt }
-        ],
-        temperature: model === this.reasonerModel ? 0.3 : 0.1
-      };
+    if (responseJson && model !== this.reasonerModel) {
+      body.response_format = { type: "json_object" };
+    }
 
-      if (responseJson && model !== this.reasonerModel) {
-        body.response_format = { type: "json_object" };
-      }
+    const parsedUrl = new URL(`${this.baseUrl}/chat/completions`);
+    const postData = JSON.stringify(body);
+    const isHttps = parsedUrl.protocol === "https:";
+    const transport = isHttps ? https : http;
 
-      const response = await fetch(`${this.baseUrl}/chat/completions`, {
-        method: "POST",
-        headers: {
-          "Content-Type": "application/json",
-          Authorization: `Bearer ${this.apiKey}`
+    const data = await new Promise<any>((resolve, reject) => {
+      const req = transport.request(
+        {
+          hostname: parsedUrl.hostname,
+          port: parsedUrl.port || (isHttps ? 443 : 80),
+          path: parsedUrl.pathname + parsedUrl.search,
+          method: "POST",
+          headers: {
+            "Content-Type": "application/json",
+            Authorization: `Bearer ${this.apiKey}`,
+            "Content-Length": Buffer.byteLength(postData)
+          },
+          timeout: this.timeoutMs
         },
-        body: JSON.stringify(body),
-        signal: controller.signal
+        res => {
+          let resBody = "";
+          res.on("data", chunk => {
+            resBody += chunk;
+          });
+          res.on("end", () => {
+            if (res.statusCode && res.statusCode >= 400) {
+              reject(new Error(`DeepSeek API error (${res.statusCode}): ${resBody}`));
+            } else {
+              try {
+                resolve(JSON.parse(resBody));
+              } catch (e) {
+                reject(new Error(`Failed to parse DeepSeek response JSON: ${resBody}`));
+              }
+            }
+          });
+        }
+      );
+
+      req.on("error", reject);
+      req.on("timeout", () => {
+        req.destroy(new Error(`DeepSeek API request timed out after ${this.timeoutMs}ms`));
       });
 
-      if (!response.ok) {
-        const errorText = await response.text();
-        throw new Error(`DeepSeek API error (${response.status}): ${errorText}`);
-      }
+      req.write(postData);
+      req.end();
+    });
 
-      const data = (await response.json()) as any;
-      const content = data.choices?.[0]?.message?.content || "";
+    const content = data.choices?.[0]?.message?.content || "";
 
-      if (responseJson) {
-        // Strip markdown code blocks if model wrapped it in ```json ... ```
-        const cleaned = content.replace(/^```json\s*/i, "").replace(/```\s*$/i, "").trim();
-        return JSON.parse(cleaned);
-      }
-      return content;
-    } finally {
-      clearTimeout(timeout);
+    if (responseJson) {
+      // Strip markdown code blocks if model wrapped it in ```json ... ```
+      const cleaned = content.replace(/^```json\s*/i, "").replace(/```\s*$/i, "").trim();
+      return JSON.parse(cleaned);
     }
+    return content;
   }
 
   async clarifyTask(department: string, targetRole: string, rawDescription: string): Promise<EnterpriseTaskContext> {
@@ -183,7 +210,13 @@ export class DeepSeekAdapter implements ModelAdapter {
     requirements: RoleRequirement[]
   ): Promise<RequirementAssessment[]> {
     // DeepSeek-R1 deep causal reasoning model
-    const systemPrompt = `You are an evidence attribution reasoning engine. For each requirement, determine evidence status: "SUPPORTED", "PARTIAL", "MATERIAL_INSUFFICIENT", or "NO_EVIDENCE". Never output arbitrary match scores. Anchor claims to line numbers. If evidence is not SUPPORTED, level must be null. Return JSON: { assessments: [{ requirementId, requirementCode, evidenceStatus, level, reasons, ruleIds: string[], anchorIds: string[] }] }`;
+    const systemPrompt = `You are an evidence attribution reasoning engine. For each requirement, evaluate candidate execution against 4 discrete evidence states:
+- "SUPPORTED": Clear personal verified deliverable and metrics with specific line citations.
+- "PARTIAL": Relevant execution or partial attempt present, but lacks systematic taxonomy, root-cause categorization, or complete deliverables.
+- "MATERIAL_INSUFFICIENT": Applicant explicitly notes limitation, sample size too small (e.g. manual check of few samples), or lacks formal evaluation harness.
+- "NO_EVIDENCE": Unmentioned in material (apply Null Competency).
+
+Never output arbitrary match scores or percentages. Anchor claims to line numbers. If evidence is not SUPPORTED, level must be null. Return JSON: { assessments: [{ requirementId, requirementCode, evidenceStatus, level, reasons, ruleIds: string[], anchorIds: string[] }] }`;
     const userPrompt = `Requirements:\n${JSON.stringify(requirements)}\n\nExtracted Episodes:\n${JSON.stringify(episodes)}\n\nExtracted Tasks:\n${JSON.stringify(tasks)}\n\nRaw Resume:\n${rawTextLines.join("\n")}`;
 
     const result = await this.callLlm(this.reasonerModel, systemPrompt, userPrompt);
