@@ -9,6 +9,7 @@ coverage/
 .env.*
 !.env.example
 *.log
+docs/*supabase*info*
 
 # Local databases
 *.sqlite
