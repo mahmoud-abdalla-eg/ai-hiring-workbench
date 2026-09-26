@@ -55,7 +55,7 @@ export function buildApp(customAdapter?: ModelAdapter): FastifyInstance {
   });
 
   // Model Adapter initialization
-  const modelProvider = process.env.MODEL_PROVIDER?.toLowerCase() || "mock";
+  const modelProvider = process.env.MODEL_PROVIDER?.trim().toLowerCase() || "mock";
   const modelAdapter: ModelAdapter =
     customAdapter || (modelProvider === "deepseek" ? new DeepSeekAdapter() : new MockAdapter());
 
